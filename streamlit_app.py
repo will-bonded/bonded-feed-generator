@@ -39,6 +39,18 @@ from feed_tool.turnstile import verify_turnstile
 from feed_tool import registry
 
 APP_TITLE = "Bonded Feed Generator"
+
+# Brand assets. Anchored to this file's own directory rather than a bare
+# relative path — Streamlit itself resolves .streamlit/secrets.toml relative
+# to the script's location, but plain os.path.exists()/open() calls resolve
+# against the process's current working directory instead, which isn't
+# guaranteed to be the repo root depending on how the process was launched.
+# Both wirings below degrade gracefully (emoji favicon, no logo) if the
+# files aren't there, so nothing breaks either way.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(_APP_DIR, "assets", "bonded-logo.png")
+FAVICON_PATH = os.path.join(_APP_DIR, "assets", "favicon.png")
+
 PERMISSION_LABEL = "I confirm I have permission to pull product data from this website."
 TERMS_BLURB = (
     "This tool reads publicly available product data from the URL you provide. "
@@ -68,6 +80,42 @@ def daily_flow_configured() -> bool:
     return turnstile_configured() and all(get_secret(k) for k in ("github_repo", "github_token"))
 
 
+def inject_brand_styles() -> None:
+    """Google-hosted Poppins + the shared status-badge pill styling (same
+    classes already proven in the budget pacer's HTML report, for a
+    consistent look across both tools)."""
+    st.markdown(
+        """
+        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap"
+              rel="stylesheet">
+        <style>
+        /* :not([data-testid="stIconMaterial"]) matters here — those spans
+           render Material Symbols icons (expander arrows, etc.) as ligature
+           text in a dedicated icon font. Overriding their font-family turns
+           them into literal text like "keyboard_arrow_right" instead of an
+           arrow glyph, so they're excluded rather than left to fight an
+           !important rule with a guessed replacement font name. */
+        html, body, [class*="css"],
+        h1, h2, h3, h4, h5, h6, p, button, input, label, a,
+        span:not([data-testid="stIconMaterial"]),
+        div:not([data-testid="stIconMaterial"]) {
+            font-family: 'Poppins', sans-serif !important;
+        }
+        .status-badge {
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+            color: white;
+            font-weight: 600;
+        }
+        .status-success { background: #1A7A4A; }
+        .status-pending { background: #DE8344; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def run_pipeline(url: str) -> tuple[dict, bytes, str]:
     """Runs feed_tool against `url`, returns (summary, csv_bytes, captured_log)."""
     log_buffer = io.StringIO()
@@ -94,9 +142,11 @@ def show_summary(summary: dict, log_text: str) -> None:
                 "JS rendering, or use a URL structure this tool doesn't recognize yet."
             )
     else:
-        st.success(
-            f"Built {summary['total']} rows — {summary['clean']} clean, "
-            f"{len(summary['flagged'])} flagged."
+        st.markdown(
+            f"Built **{summary['total']}** rows — "
+            f"<span class=\"status-badge status-success\">{summary['clean']} clean</span> "
+            f"<span class=\"status-badge status-pending\">{len(summary['flagged'])} flagged</span>",
+            unsafe_allow_html=True,
         )
         if summary["flagged"]:
             with st.expander(f"{len(summary['flagged'])} flagged rows (missing a required field)"):
@@ -182,7 +232,13 @@ def handle_daily_registration(url: str) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🧩")
+    favicon = FAVICON_PATH if os.path.exists(FAVICON_PATH) else "🧩"
+    st.set_page_config(page_title=APP_TITLE, page_icon=favicon, layout="centered")
+    inject_brand_styles()
+
+    if os.path.exists(LOGO_PATH):
+        st.logo(LOGO_PATH)
+
     st.title(APP_TITLE)
     st.write("Build a Meta Commerce Manager product feed from any store URL.")
 
@@ -262,12 +318,15 @@ def main() -> None:
         )
     else:
         with st.expander("Want to stop a daily feed?"):
-            st.write(
+            st.markdown(
+                "<p style=\"font-size: 14px;\">"
                 "Registered feeds aren't self-service to remove — the registry that maps "
                 "store URLs to feed IDs lives in this public repo, so a self-service "
                 "\"remove by ID\" form would let anyone who can see that file deactivate "
-                "*any* registered feed, not just their own. Click below to email us your "
-                "feed ID or store URL and we'll deactivate it for you."
+                "<em>any</em> registered feed, not just their own. Click below to email us "
+                "your feed ID or store URL and we'll deactivate it for you."
+                "</p>",
+                unsafe_allow_html=True,
             )
             st.link_button(
                 "Contact us to deactivate a feed",

@@ -192,3 +192,38 @@ element into `window.top.document` instead: that script then executes in
 the top document's own (unsandboxed) realm and navigates itself. Confirmed
 working end-to-end in-browser during development, including the
 downstream query-param verification path.
+
+## Brand CSS: exclude Material icons from the global font override
+
+`inject_brand_styles()` forces Poppins everywhere with `!important`, since
+Streamlit's own emotion-generated CSS otherwise wins on specificity for
+plain-inheritance rules (a bare `body { font-family: ... }` doesn't reach
+`<h1>`/`<p>` etc., because Streamlit sets font-family on those directly,
+and any explicit rule beats pure inheritance regardless of specificity).
+
+First pass applied `!important` to every element including bare `span`s,
+which broke Streamlit's own icons (expander arrows, etc.) — they're
+rendered as ligature text (e.g. literally `keyboard_arrow_right`) in a
+dedicated icon font (`data-testid="stIconMaterial"`), and forcing Poppins
+onto them makes that ligature text render as literal text instead of a
+glyph. Fixed by excluding `[data-testid="stIconMaterial"]` from the
+override via `:not()` rather than guessing the icon font's exact name and
+fighting it with a second `!important` rule — simpler, and correct
+regardless of which icon font a future Streamlit version actually uses
+internally. Worth remembering if the brand CSS gets touched again: any
+new broad selector added here needs the same exclusion, or Streamlit's
+icons will silently break again.
+
+## Asset paths anchored to the script's own directory, not cwd
+
+`LOGO_PATH`/`FAVICON_PATH` resolve via `os.path.dirname(os.path.abspath(__file__))`
+rather than a bare relative path like `"assets/favicon.png"`. Caught
+during testing: Streamlit resolves `.streamlit/secrets.toml` relative to
+the script's own location, but a plain `os.path.exists()`/`open()` call
+resolves relative to the process's current working directory instead —
+and those aren't guaranteed to be the same directory depending on how the
+process gets launched (they differed in the local dev-container-style
+launcher used during this build, silently falling back to the emoji
+favicon and no logo with no error at all). Anchoring to `__file__` is
+correct regardless of launch method — including Streamlit Community
+Cloud's own — so this isn't a workaround for one specific environment.
