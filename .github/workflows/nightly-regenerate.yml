@@ -1,0 +1,43 @@
+name: Nightly Feed Regeneration
+
+# Replaces the old single-store daily-feed.yml. This is registry-driven and
+# multi-tenant: it loops over every entry in registry.json (added by the
+# Streamlit app's "Keep this updated daily" flow) and regenerates each one's
+# feeds/{id}.csv, rather than targeting one hardcoded store.
+
+on:
+  schedule:
+    # 03:00 UTC every day — edit the cron expression to change the time.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Regenerate all registered feeds
+        run: python scripts/regenerate_feeds.py
+
+      - name: Commit updated feeds (single batch commit)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add feeds/
+          if git diff --cached --quiet; then
+            echo "No feed changes to commit."
+          else
+            git commit -m "Nightly feed regeneration ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            git push
+          fi

@@ -1,0 +1,35 @@
+{
+  "products": [
+    {
+      "id": 1001,
+      "title": "Classic Tee",
+      "handle": "classic-tee",
+      "body_html": "<p>Soft cotton t-shirt.</p>",
+      "vendor": "Bonded Apparel",
+      "images": [
+        {"id": 501, "src": "https://cdn.example.com/tee-black.jpg"},
+        {"id": 502, "src": "https://cdn.example.com/tee-white.jpg"}
+      ],
+      "variants": [
+        {
+          "id": 9001,
+          "title": "Black / M",
+          "price": "19.99",
+          "compare_at_price": "24.99",
+          "available": true,
+          "sku": "TEE-BLK-M",
+          "image_id": 501
+        },
+        {
+          "id": 9002,
+          "title": "White / M",
+          "price": "19.99",
+          "compare_at_price": null,
+          "available": false,
+          "sku": "TEE-WHT-M",
+          "image_id": 502
+        }
+      ]
+    }
+  ]
+}
