@@ -108,6 +108,78 @@ extension that most real Disallow rules use in practice (`Disallow:
 `protego` (same parser Scrapy uses, still pure Python, no compiled deps)
 after confirming both bugs concretely against that site's live robots.txt.
 
+## Turnstile gates both flows, not just daily registration
+
+Originally only the "keep this updated daily" flow required a solved
+Turnstile challenge; "get a one-off CSV" ran with no gate at all. That's a
+real gap once the app is genuinely public: a form that runs an
+unauthenticated, server-side, unlimited scrape is an open scraping proxy —
+usable to anonymously hit arbitrary third-party sites through this app's
+own server (and its own `BondedFeedBot` User-Agent / contact info), or to
+just burn through Streamlit Community Cloud's free-tier compute.
+
+Fixed by gating both flows behind the same Turnstile check whenever it's
+configured (`turnstile_configured()`, split out from
+`daily_flow_configured()` which still also needs the GitHub secrets and
+only controls whether the daily option is *offered*). When Turnstile
+isn't configured at all — e.g. local/dev use — both flows still run
+ungated, same graceful-degradation pattern already used elsewhere in this
+app rather than hard-failing on missing config.
+
+## Feed removal is contact-based, not self-service
+
+First attempt at this was a public "enter your feed ID to remove it"
+form, on the theory that a random 10-hex-char feed id — never guessable,
+shown only to whoever registered it — was equivalent to the "unlisted
+URL" model already used for the feed CSV itself (anyone with the
+`raw.githubusercontent.com` link can already read it; this just extended
+"possession of the id" to "can also remove it").
+
+That reasoning missed something the unlisted-URL model doesn't have:
+`registry.json` — the file mapping every `store_url` to its feed id — is
+itself a plain file in this **public** repo. It's not obscure at all;
+anyone can open it on GitHub and read the exact id for any registered
+store's feed. So the "self-service by ID" form wasn't gated by possession
+of a hard-to-guess secret — it was gated by nothing, since the id for any
+target was one file-open away. Concretely: a competitor could look up a
+business's feed id in `registry.json` and deactivate their live Meta
+catalog feed, entirely unauthenticated.
+
+There's no account system in this tool by design (see "No Google
+Sheets / OAuth" above), so removal can't check "is this actually your
+feed" against a login either. Given that, the right fix isn't a cleverer
+public form — it's not exposing a public write path for removal at all.
+The app now points people at a `mailto:` link to Bonded instead, and
+`feed_tool/registry.py`'s `remove_registry_entry()`/`delete_file()`
+functions are kept working but unwired from any public button — they're
+what Bonded calls directly (or from a small internal script) once a
+request's been manually verified as legitimate.
+
+A real fix that would preserve self-service: split `registry.json` into a
+separate *private* repo (keep only `feeds/*.csv` public), so the mapping
+itself isn't publicly readable. Not done — it roughly doubles the setup
+this tool asks of anyone deploying their own copy (second repo, second
+secret, and the nightly job would need cross-repo API calls instead of
+plain local-file git operations just for the registry), which doesn't fit
+this tool's "minimal setup" premise for what's ultimately a low-volume
+admin action.
+
+## Auto-prune threshold: 3 consecutive unsuccessful nights
+
+The nightly job drops a feed (from `registry.json` and its `feeds/{id}.csv`)
+after 3 consecutive nights of coming back empty or erroring outright,
+rather than 1 or some larger number. Reasoning: a single bad night is
+usually transient (the target site was briefly down, rate-limited us, had
+a one-off outage) and pruning on the first failure would be too eager,
+silently dropping feeds that would've recovered on their own. But letting
+a truly dead feed (a site that's gone, or whose URL structure changed such
+that this tool can no longer extract anything from it) sit forever isn't
+right either — it just consumes a slot against the 500-feed cap
+indefinitely. 3 consecutive nights is a middle ground: enough to absorb a
+transient blip, not so many that a genuinely abandoned feed lingers for
+weeks. Revisit if real usage shows this number is wrong in either
+direction.
+
 ## Turnstile widget → Streamlit communication
 
 `st.components.v1.html` renders in a sandboxed iframe that has

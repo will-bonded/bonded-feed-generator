@@ -1,18 +1,21 @@
 """
 Bonded Feed Generator — one-page web app for the Meta catalog feed builder.
 
-Two flows:
+Two flows, both gated behind a Cloudflare Turnstile human check whenever
+Turnstile is configured (a public form that runs a server-side scrape with
+zero rate limit would otherwise be an open scraping proxy for anyone):
   A. "Get a one-off CSV"        — runs feed_tool synchronously, offers a
                                    download, nothing persists anywhere.
-  B. "Keep this updated daily"  — same, plus: gated behind a Cloudflare
-                                   Turnstile human check, then commits the
-                                   CSV + a registry entry to this repo via
-                                   the GitHub Contents API, and hands back a
-                                   stable raw.githubusercontent.com URL for
-                                   Meta Commerce Manager to poll. A separate
+  B. "Keep this updated daily"  — same, plus: commits the CSV + a registry
+                                   entry to this repo via the GitHub
+                                   Contents API, and hands back a stable
+                                   raw.githubusercontent.com URL for Meta
+                                   Commerce Manager to poll. A separate
                                    nightly GitHub Actions job
                                    (.github/workflows/nightly-regenerate.yml)
-                                   re-runs every registered feed daily.
+                                   re-runs every registered feed daily, and
+                                   auto-prunes one that's failed or come
+                                   back empty for several days running.
 
 Why Flow B doesn't use Google Sheets/OAuth, why rate-limiting here is a
 single global cap rather than per-IP tracking, and the SSRF/redirect
@@ -46,6 +49,8 @@ TERMS_BLURB = (
 
 FLOW_ONEOFF = "Get a one-off CSV"
 FLOW_DAILY = "Keep this updated daily"
+FLOW_PARAM_ONEOFF = "oneoff"
+FLOW_PARAM_DAILY = "daily"
 
 
 def get_secret(name: str):
@@ -55,10 +60,12 @@ def get_secret(name: str):
         return None
 
 
+def turnstile_configured() -> bool:
+    return bool(get_secret("turnstile_site_key")) and bool(get_secret("turnstile_secret_key"))
+
+
 def daily_flow_configured() -> bool:
-    return all(get_secret(k) for k in (
-        "github_repo", "github_token", "turnstile_site_key", "turnstile_secret_key"
-    ))
+    return turnstile_configured() and all(get_secret(k) for k in ("github_repo", "github_token"))
 
 
 def run_pipeline(url: str) -> tuple[dict, bytes, str]:
@@ -99,8 +106,9 @@ def show_summary(summary: dict, log_text: str) -> None:
         st.code(log_text or "(no output)")
 
 
-def render_turnstile_widget(site_key: str, url: str, permission: bool) -> None:
+def render_turnstile_widget(site_key: str, url: str, permission: bool, flow_param: str) -> None:
     safe_url = json.dumps(url)
+    safe_flow = json.dumps(flow_param)
     permission_flag = "1" if permission else "0"
     html = f"""
     <div style="display:flex;justify-content:center;padding:8px 0;">
@@ -117,7 +125,7 @@ def render_turnstile_widget(site_key: str, url: str, permission: bool) -> None:
         // runs in the top document's own unsandboxed realm and works.
         var params = new URLSearchParams(window.top.location.search);
         params.set("turnstile_token", token);
-        params.set("flow", "daily");
+        params.set("flow", {safe_flow});
         params.set("permission", "{permission_flag}");
         params.set("url", {safe_url});
         var navScript = window.top.document.createElement("script");
@@ -127,6 +135,15 @@ def render_turnstile_widget(site_key: str, url: str, permission: bool) -> None:
     </script>
     """
     st.components.v1.html(html, height=100)
+
+
+def handle_oneoff(url: str) -> None:
+    with st.spinner("Building your feed..."):
+        summary, csv_bytes, log_text = run_pipeline(url)
+    show_summary(summary, log_text)
+    if summary["total"] > 0:
+        st.download_button("Download feed.csv", csv_bytes, file_name="feed.csv", mime="text/csv")
+        st.info("This file isn't saved anywhere — download it now.")
 
 
 def handle_daily_registration(url: str) -> None:
@@ -175,6 +192,7 @@ def main() -> None:
     if turnstile_token:
         url = query_params.get("url", "")
         permission_ok = query_params.get("permission") == "1"
+        flow_param = query_params.get("flow", FLOW_PARAM_ONEOFF)
         # Consume the token immediately so a page refresh/back-nav can't replay it.
         del st.query_params["turnstile_token"]
 
@@ -191,8 +209,10 @@ def main() -> None:
             secret_key = get_secret("turnstile_secret_key")
             if not verify_turnstile(turnstile_token, secret_key):
                 st.error("Verification failed or expired — please try again below.")
-            else:
+            elif flow_param == FLOW_PARAM_DAILY:
                 handle_daily_registration(url)
+            else:
+                handle_oneoff(url)
         return  # this render is entirely about resolving the redirect above
 
     with st.form("main_form"):
@@ -218,27 +238,44 @@ def main() -> None:
             except SecurityError as e:
                 st.error(str(e))
             else:
-                if flow == FLOW_ONEOFF:
-                    with st.spinner("Building your feed..."):
-                        summary, csv_bytes, log_text = run_pipeline(url)
-                    show_summary(summary, log_text)
-                    if summary["total"] > 0:
-                        st.download_button("Download feed.csv", csv_bytes,
-                                            file_name="feed.csv", mime="text/csv")
-                        st.info("This file isn't saved anywhere — download it now.")
-                else:
-                    st.session_state["pending_daily"] = {"url": url, "permission": permission}
+                if turnstile_configured():
+                    st.session_state["pending_verification"] = {
+                        "url": url, "permission": permission, "flow": flow,
+                    }
+                elif flow == FLOW_ONEOFF:
+                    handle_oneoff(url)
+                # else: FLOW_DAILY without turnstile_configured() can't happen —
+                # daily_flow_configured() (which requires it) gates whether
+                # FLOW_DAILY is even offered as an option above.
 
-    pending = st.session_state.get("pending_daily")
+    pending = st.session_state.get("pending_verification")
     if pending:
-        st.write("Complete this check to confirm you're not a bot, then this will register automatically:")
-        render_turnstile_widget(get_secret("turnstile_site_key"), pending["url"], pending["permission"])
+        st.write("Complete this check to confirm you're not a bot, then this will continue automatically:")
+        flow_param = FLOW_PARAM_DAILY if pending["flow"] == FLOW_DAILY else FLOW_PARAM_ONEOFF
+        render_turnstile_widget(get_secret("turnstile_site_key"), pending["url"],
+                                 pending["permission"], flow_param)
 
     if not daily_flow_configured():
         st.caption(
             "(\"Keep this updated daily\" isn't configured on this deployment yet — "
             "see README.md for the Turnstile + GitHub secrets it needs.)"
         )
+    else:
+        with st.expander("Want to stop a daily feed?"):
+            st.write(
+                "Registered feeds aren't self-service to remove — the registry that maps "
+                "store URLs to feed IDs lives in this public repo, so a self-service "
+                "\"remove by ID\" form would let anyone who can see that file deactivate "
+                "*any* registered feed, not just their own. Click below to email us your "
+                "feed ID or store URL and we'll deactivate it for you."
+            )
+            st.link_button(
+                "Contact us to deactivate a feed",
+                "mailto:connect@bondedagency.com"
+                "?subject=Deactivate%20a%20daily%20feed"
+                "&body=Please%20include%20the%20feed%20ID%20or%20store%20URL%20"
+                "you%27d%20like%20to%20stop%20refreshing%3A%0A%0A",
+            )
 
 
 if __name__ == "__main__":

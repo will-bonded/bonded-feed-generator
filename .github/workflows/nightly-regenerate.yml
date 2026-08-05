@@ -3,7 +3,10 @@ name: Nightly Feed Regeneration
 # Replaces the old single-store daily-feed.yml. This is registry-driven and
 # multi-tenant: it loops over every entry in registry.json (added by the
 # Streamlit app's "Keep this updated daily" flow) and regenerates each one's
-# feeds/{id}.csv, rather than targeting one hardcoded store.
+# feeds/{id}.csv, rather than targeting one hardcoded store. Also
+# auto-prunes (and deletes the stale feeds/{id}.csv for) any entry that's
+# been unsuccessful for several consecutive nights — see
+# scripts/regenerate_feeds.py.
 
 on:
   schedule:
@@ -30,11 +33,11 @@ jobs:
       - name: Regenerate all registered feeds
         run: python scripts/regenerate_feeds.py
 
-      - name: Commit updated feeds (single batch commit)
+      - name: Commit updated feeds + registry (single batch commit)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add feeds/
+          git add feeds/ registry.json
           if git diff --cached --quiet; then
             echo "No feed changes to commit."
           else

@@ -72,6 +72,13 @@ def put_file(repo: str, path: str, content_bytes: bytes, message: str, token: st
     return resp.json()
 
 
+def delete_file(repo: str, path: str, token: str, sha: str, message: str, branch: str = "main") -> None:
+    body = {"message": message, "sha": sha, "branch": branch}
+    resp = requests.delete(f"{GITHUB_API}/repos/{repo}/contents/{path}",
+                            headers=_headers(token), json=body, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+
+
 def read_registry(repo: str, token: str) -> tuple[list, str | None]:
     content, sha = get_file(repo, "registry.json", token)
     entries = json.loads(content) if content else []
@@ -138,6 +145,55 @@ def append_registry_entry(repo: str, token: str, entry: dict, max_retries: int =
             raise RegistryError(f"Could not register feed: {e}") from e
 
     raise RegistryError(f"Could not register feed after {max_retries} attempts: {last_error}")
+
+
+def remove_registry_entry(repo: str, token: str, feed_id: str, max_retries: int = 3) -> bool:
+    """Removes `feed_id` from registry.json and best-effort deletes its
+    feeds/{feed_id}.csv. Returns False if no entry with that id exists (not
+    an error — the caller can show "no such feed" rather than a failure).
+
+    NOT wired to any public button in streamlit_app.py — call this directly
+    (or from a small internal script) once a removal request has been
+    manually verified as legitimate. It was originally exposed as a public
+    "enter your feed ID to remove it" form, on the theory that the feed id
+    was an unguessable-enough secret; that reasoning missed that
+    registry.json (which maps every store_url to its feed id) is itself a
+    plain file in this public repo, so anyone can already look up any
+    store's feed id there. See DECISIONS.md.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            entries, sha = read_registry(repo, token)
+        except requests.RequestException as e:
+            raise RegistryError(f"Could not read the feed registry from GitHub: {e}") from e
+
+        if not any(e["id"] == feed_id for e in entries):
+            return False
+
+        remaining = [e for e in entries if e["id"] != feed_id]
+        content = (json.dumps(remaining, indent=2) + "\n").encode("utf-8")
+
+        try:
+            put_file(repo, "registry.json", content, f"Remove feed {feed_id}", token, sha=sha)
+        except requests.HTTPError as e:
+            last_error = e
+            if e.response is not None and e.response.status_code == 409 and attempt < max_retries - 1:
+                continue  # someone else's write landed between our read and write — retry
+            raise RegistryError(f"Could not remove feed: {e}") from e
+
+        # Registry is updated at this point — the csv file lingering a bit
+        # longer on a transient failure here isn't worth failing over.
+        try:
+            _, csv_sha = get_file(repo, f"feeds/{feed_id}.csv", token)
+            if csv_sha:
+                delete_file(repo, f"feeds/{feed_id}.csv", token, csv_sha, f"Delete feed {feed_id}")
+        except requests.RequestException:
+            pass
+
+        return True
+
+    raise RegistryError(f"Could not remove feed after {max_retries} attempts: {last_error}")
 
 
 def now_iso() -> str:

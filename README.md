@@ -15,21 +15,47 @@ Open the app (see **Deployment** for the URL once it's live) and:
 
 1. Enter a store URL.
 2. Confirm you have permission to pull product data from that site.
-3. Pick one:
+3. Pick one. Whenever Turnstile is configured, both require a quick human
+   check first — a public form that runs an unlimited server-side scrape
+   with no gate at all would otherwise be an open scraping proxy for
+   anyone. (Without Turnstile configured, they're offered ungated instead,
+   so the app still works for local/dev use with no setup.)
    - **Get a one-off CSV** — runs immediately, gives you a download link.
      Nothing is saved anywhere; refresh the page and it's gone.
-   - **Keep this updated daily** — after a quick human check (Cloudflare
-     Turnstile), this commits the feed to this repo at a permanent URL
+   - **Keep this updated daily** — commits the feed to this repo at a
+     permanent URL
      (`https://raw.githubusercontent.com/{org}/{repo}/main/feeds/{id}.csv`)
      and registers it for automatic nightly regeneration. Paste that URL
      into Meta Commerce Manager's **Catalog > Data Sources > Scheduled
      Feed** setup, and set Meta's own daily fetch schedule there — Meta
      polls the URL itself from then on.
 
-Guardrails on the daily-refresh flow: a human check (Turnstile) before
-anything is written, a cap of 500 total active daily feeds, and a cap on
-how many new feeds can be registered per hour (see `DECISIONS.md` for why
-this is a global cap rather than per-user tracking).
+Guardrails on the daily-refresh flow: a cap of 500 total active daily
+feeds, and a cap on how many new feeds can be registered per hour (see
+`DECISIONS.md` for why this is a global cap rather than per-user
+tracking) — on top of the Turnstile check both flows already require.
+
+## Removing a daily feed
+
+This is deliberately **not** self-service. `registry.json` — the file
+mapping every store URL to its feed ID — lives in this public repo, so
+anyone can already read it; a self-service "remove by ID" form would let
+anyone who can see that file deactivate *any* registered feed, not just
+their own (e.g. a competitor deactivating another business's feed). So
+instead, an expander at the bottom of the app ("Want to stop a daily
+feed?") opens a pre-filled email to `connect@bondedagency.com` — send the
+feed ID or store URL and it'll be deactivated on request.
+
+(`feed_tool/registry.py`'s `remove_registry_entry()` still exists and
+works — it's just not wired to a public button. It's what you'd call
+directly, or from a small internal script, once you've verified a
+removal request is legitimate.)
+
+A feed also gets removed automatically, without anyone doing anything:
+the nightly job tracks how many nights in a row a feed has come back
+empty or failed outright, and drops it after 3 consecutive unsuccessful
+nights — so an abandoned or permanently-broken feed doesn't sit forever
+consuming a slot against the 500-feed cap.
 
 ## How the feed itself is built
 
@@ -297,6 +323,44 @@ the CLI) — not wired into the public web app; see `DECISIONS.md` for why.
   repo/token (only tested against a deliberately invalid one, to confirm
   it fails cleanly) — worth doing once this is deployed for real, before
   relying on it for a client.
+- ✅ **Turnstile now gates both flows, not just daily registration** — the
+  one-off CSV flow originally had no gate at all, which meant a public
+  form running an unlimited, unauthenticated server-side scrape doubled as
+  an open scraping proxy for anyone. Config detection was split into
+  `turnstile_configured()` (gates either flow) and `daily_flow_configured()`
+  (also needs the GitHub secrets, only affects whether the daily option is
+  offered), and the redirect round-trip now carries which flow to resume,
+  not just the URL. Verified: the config-detection logic directly (6
+  cases), and the redirect dispatch by navigating straight to the
+  post-verification URL for each flow value — `flow=oneoff` correctly ran
+  the download path with no GitHub write attempted, `flow=daily` correctly
+  attempted the registration path, and no `flow` param at all correctly
+  defaulted to the safer one-off path rather than silently registering
+  something.
+- ✅ **Feed removal + nightly auto-pruning** — `registry.remove_registry_entry()`
+  unit-tested against a mocked GitHub API (7 cases: removing a real entry
+  drops it from the registry and deletes its CSV, leaves other entries
+  untouched, removing an unknown id returns `False` rather than erroring).
+  Originally wired to a public self-service "enter your feed ID" button;
+  caught during review that `registry.json` being public makes that unsafe
+  (anyone can look up any store's feed ID and deactivate it), so it's kept
+  as a function only — the public app now points at a contact-Bonded
+  mailto flow instead (verified live: renders the correct pre-filled
+  `mailto:` link). The nightly script's pruning logic tested with a mocked
+  `build_feed` covering all 4 outcomes at once — a feed that succeeds
+  (counter resets), one that's failed twice but not yet at the limit
+  (stays, counter increments), one that hits the 3-consecutive-failure
+  limit via empty results (pruned, stale CSV deleted), and one that hits
+  it via a raised exception (also pruned) — all 9 assertions passed.
+- ✅ **CSV/formula-injection sanitization** — any field starting with
+  `=`, `+`, `-`, `@`, tab, or CR now gets prefixed with a leading
+  apostrophe so it can't be interpreted as a formula if the CSV is opened
+  in Excel/Sheets, since every field ultimately comes from scraping a
+  third-party site. Unit-tested (11 cases): dangerous prefixes on
+  title/description/brand/sku all get neutralized, normal titles/URLs/IDs
+  pass through completely unchanged, and the required-field QC check still
+  correctly treats a sanitized-but-present field as present (only genuinely
+  missing fields get flagged).
 
 ## Possible next steps
 
