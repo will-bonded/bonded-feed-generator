@@ -33,6 +33,15 @@ true zero-match outcome, so it has no effect on sites the hints already
 handle correctly — it's strictly a fallback for the "found nothing" case,
 not a replacement for hint-based filtering where that already works.
 
+A hint can also match something spurious rather than nothing at all: a
+site whose real catalog uses no hint keyword can still have one stray,
+unrelated URL that happens to contain one, which makes the hint-matched
+set non-empty without containing any real products. `all_pages` (every
+non-sitemap page found, hint-matched or not) is returned alongside `urls`
+so the caller can retry via content-based extraction if the hint-matched
+pages turn out to yield nothing real, rather than treating a non-empty
+hint match as proof the real catalog was found.
+
 A sitemap can list more than HTML product pages: image assets (with or
 without a recognizable file extension — some platforms serve them through
 a dynamic URL with none at all) are filtered out, since they'd otherwise
@@ -127,14 +136,24 @@ def discover_product_urls(
     max_pages: int = 500,
 ) -> dict:
     """
-    Returns {"urls": [...], "truncated": bool, "used_content_fallback": bool,
-    "discovery_time_capped": bool}.
+    Returns {"urls": [...], "all_pages": [...], "truncated": bool,
+    "used_content_fallback": bool, "discovery_time_capped": bool}.
     `truncated` is True when more matching URLs existed than max_pages
     allowed — the caller should surface this rather than silently shipping
     an incomplete feed. `used_content_fallback` is True when the hints
     matched nothing and every non-sitemap URL found was returned instead —
     the caller should let the content-based extractor do the real filtering
     in that case, and may want to say so, since it's slower.
+    `all_pages` is every non-sitemap page found, regardless of hint
+    matching — a superset of `urls` when hints DID match something. A
+    hint can match a single spurious URL on a site whose real catalog uses
+    no hint keyword at all (seen in testing: a Magento store's sitemap
+    had thousands of flat, keyword-free product/category URLs plus one
+    unrelated literal "/product/" page, and that one match alone was
+    enough to skip content-fallback and miss the entire real catalog) — so
+    the caller should retry against `all_pages` via content-based
+    extraction if the hint-matched `urls` turn out to yield nothing real,
+    rather than trusting a hint match just because it's non-empty.
     `discovery_time_capped` is True when DISCOVERY_TIME_BUDGET_SECONDS was
     hit before every known sitemap file was fetched — a distinct condition
     from `truncated`: that one means "found more candidates than you asked
@@ -172,6 +191,7 @@ def discover_product_urls(
             to_check.append(sitemap_url)
 
     seen_sitemaps = set()
+    seen_pages: set[str] = set()
     all_pages: list[str] = []
     hinted_pages: list[str] = []
     discovery_time_capped = False
@@ -214,6 +234,13 @@ def discover_product_urls(
                 continue  # off-domain page — see the robots.txt cross-domain note above
             if not _looks_like_page(p):
                 continue
+            # Some sites declare the exact same sitemap content at more than
+            # one URL (seen in testing: a Magento store's /sitemap.xml and
+            # /pub/sitemap.xml were byte-identical) — without this, every
+            # page in it gets queued for extraction twice.
+            if p in seen_pages:
+                continue
+            seen_pages.add(p)
             all_pages.append(p)
             if sitemap_itself_hinted or any(hint in p.lower() for hint in hints):
                 hinted_pages.append(p)
@@ -223,6 +250,16 @@ def discover_product_urls(
 
     return {
         "urls": candidates[:max_pages],
+        # Deliberately NOT capped to max_pages like `urls` is: its purpose is
+        # to give the caller something BROADER to retry against when the
+        # hint-matched `urls` turn out to be wrong (see the docstring above)
+        # — capping it to the same limit the hint pass already used would
+        # defeat that (seen in testing: a site's sitemap lists thousands of
+        # category pages before any individual product, so the first
+        # max_pages entries of a capped list were almost all categories,
+        # never reaching real products that existed further in). The 90s
+        # discovery time budget already bounds how much this can grow to.
+        "all_pages": all_pages,
         "truncated": len(candidates) > max_pages,
         "used_content_fallback": used_content_fallback,
         "discovery_time_capped": discovery_time_capped,

@@ -88,3 +88,17 @@ def get_text(url: str):
     if resp is None or resp.status_code != 200:
         return None
     return resp.text
+
+
+def get_text_with_status(url: str) -> tuple[str | None, int | None]:
+    """Like get_text(), but also returns the HTTP status code (None if the
+    request never completed at all — network error, robots-disallowed, or
+    SSRF-invalid). Callers that need to tell "no content because nothing's
+    there" apart from "no content because the site is actively refusing us"
+    (e.g. a run of 403/429/503 responses) need the status code for that;
+    get_text() alone collapses every case to None."""
+    resp = get(url)
+    if resp is None:
+        return None, None
+    text = resp.text if resp.status_code == 200 else None
+    return text, resp.status_code

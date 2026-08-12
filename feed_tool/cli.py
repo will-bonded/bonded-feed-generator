@@ -11,9 +11,43 @@ import sys
 
 from .detect import detect_platform
 from .sources import shopify, crawl, generic
-from ._http import get_text
+from ._http import get_text_with_status
 from .feed import write_feed
 from . import robots
+
+# Floor for how many pages the content-based fallback retry (see
+# _run_generic below) will sample, independent of --max-pages. That
+# setting bounds the fast, hint-based pass, which the fallback retry only
+# runs after concluding it can't be trusted — a site can list thousands of
+# category pages before any individual product in its sitemap, so a
+# fallback capped at the same (possibly much smaller) --max-pages the user
+# set for the fast path can end up sampling nothing but categories and
+# never reach a real product, even though real ones exist further in.
+FALLBACK_RETRY_MIN_PAGES = 1000
+
+# HTTP status codes commonly returned by bot-defense/rate-limiting
+# infrastructure (Cloudflare, generic WAFs, API gateways). A run of these in
+# a row is a clear, unambiguous signal — the site explicitly refusing the
+# request, not a page that merely lacks product markup.
+#
+# Deliberately NOT also treating "many consecutive 200-OK-but-no-product
+# pages" as a pushback signal, even though that's tempting: a real site's
+# sitemap can legitimately cluster hundreds of non-product pages together
+# with no blocking involved at all (seen in testing on a real Magento store
+# whose sitemap lists ~900 category pages in a row before the next real
+# product) — exactly the shape FALLBACK_RETRY_MIN_PAGES above exists to see
+# past. A content-based "dry spell" threshold would either have to sit above
+# that real depth (defeating its own purpose — rarely triggering in time to
+# actually help) or below it (falsely aborting the exact fallback pass this
+# tool relies on to find products in that shape of sitemap). Every response
+# actually observed from that site during testing was a normal HTTP 200, no
+# 403/429/503 ever seen — so there's no confirmed evidence a content-based
+# signal would even be catching real blocking rather than ordinary structure.
+_BOT_DEFENSE_STATUS_CODES = (403, 429, 503)
+
+# How many consecutive bot-defense-status responses before concluding a run
+# has been cut off, rather than just hitting the odd flaky request.
+_BOT_STATUS_STREAK_THRESHOLD = 10
 
 
 def build_feed(base_url: str, output_path: str, currency: str = "GBP",
@@ -29,6 +63,7 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
     # request per candidate page) -- shopify pulls everything from one paged
     # JSON API, so "pages attempted" isn't a comparable count there.
     pages_attempted = None
+    pushback_detected = False
 
     if platform == "shopify":
         count = 0
@@ -40,16 +75,29 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
     elif platform == "woocommerce":
         print("[woocommerce] Store API extraction not yet wired up in this build — "
               "falling back to generic JSON-LD scraping.")
-        rows, pages_attempted = _run_generic(base_url, max_pages, url_contains)
+        rows, pages_attempted, pushback_detected = _run_generic(base_url, max_pages, url_contains)
 
     else:
-        rows, pages_attempted = _run_generic(base_url, max_pages, url_contains)
+        rows, pages_attempted, pushback_detected = _run_generic(base_url, max_pages, url_contains)
 
     blocked_count = robots.get_block_count()
     if blocked_count:
         print(f"[robots] skipped {blocked_count} request(s) this site's robots.txt disallows for us")
 
-    if not rows:
+    if pushback_detected:
+        # A more specific, more actionable diagnosis than any of the
+        # messages below, whenever it applies -- supersedes them rather than
+        # stacking alongside, since "the site cut us off partway through" is
+        # a different situation from "robots.txt disallows this" or "no
+        # signal found in what we fetched".
+        if rows:
+            print(f"[warn] this site appears to push back against automated access at volume — "
+                  f"stopped early rather than continuing to hit the same wall. Delivering the "
+                  f"{len(rows)} product(s) found before that happened (this feed is INCOMPLETE).")
+        else:
+            print("[warn] this site appears to push back against automated access at volume — "
+                  "no products were captured before that happened.")
+    elif not rows:
         # robots.txt is only the FULL explanation when it accounts for every
         # attempted page -- a small blocked_count next to a much larger
         # pages_attempted (e.g. 2 of 250) means most pages were fetched fine
@@ -75,10 +123,40 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
     summary = write_feed(rows, output_path, default_currency=currency)
     summary["robots_blocked_count"] = blocked_count
     summary["pages_attempted"] = pages_attempted
+    summary["bot_pushback_detected"] = pushback_detected
     return summary
 
 
-def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict], int]:
+def _extract_from_pages(urls: list[str]) -> tuple[list[dict], int, bool]:
+    """Returns (rows, pages_attempted, pushback_detected). Stops short of
+    len(urls) if a run of _BOT_STATUS_STREAK_THRESHOLD consecutive
+    bot-defense-status responses suggests the site has cut this run off,
+    rather than genuinely lacking product markup on the remaining pages."""
+    rows = []
+    consecutive_bot_defense = 0
+
+    for i, url in enumerate(urls, 1):
+        text, status = get_text_with_status(url)
+
+        if status in _BOT_DEFENSE_STATUS_CODES:
+            consecutive_bot_defense += 1
+            if consecutive_bot_defense >= _BOT_STATUS_STREAK_THRESHOLD:
+                return rows, i, True
+        else:
+            consecutive_bot_defense = 0
+
+        if text:
+            product = generic.extract_product_from_html(text, url)
+            if product:
+                rows.append(product)
+
+        if i % 25 == 0:
+            print(f"[generic] processed {i}/{len(urls)}")
+
+    return rows, len(urls), False
+
+
+def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict], int, bool]:
     print("[generic] discovering product URLs via sitemap.xml ...")
     discovery = crawl.discover_product_urls(base_url, url_contains=url_contains, max_pages=max_pages)
     urls = discovery["urls"]
@@ -101,19 +179,35 @@ def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict
               f"INCOMPLETE regardless of --max-pages. Found {len(urls)} candidate(s) from what was "
               f"checked before stopping.")
 
-    rows = []
-    for i, url in enumerate(urls, 1):
-        html = get_text(url)
-        if not html:
-            continue
-        product = generic.extract_product_from_html(html, url)
-        if product:
-            rows.append(product)
-        if i % 25 == 0:
-            print(f"[generic] processed {i}/{len(urls)}")
+    rows, attempted, pushback = _extract_from_pages(urls)
+    print(f"[generic] extracted {len(rows)} products from {attempted} pages")
 
-    print(f"[generic] extracted {len(rows)} products from {len(urls)} pages")
-    return rows, len(urls)
+    if pushback:
+        # Already cut off once on this same site in this same run -- a large
+        # fallback retry right after would almost certainly just hit the same
+        # wall again, wasting time rather than finding anything new.
+        return rows, attempted, True
+
+    # A non-empty hint match isn't proof the real catalog was found: a site's
+    # actual catalog can use no hint keyword at all while one unrelated,
+    # spurious URL elsewhere happens to contain one (seen in testing: a
+    # Magento store's several-thousand-page flat .html catalog, plus a
+    # single stray literal "/product/" URL that alone made the hint match
+    # non-empty and skipped content-fallback entirely). If the hint-matched
+    # pages extracted nothing real, retry via content-based extraction
+    # across every other page found before giving up.
+    if not rows and not discovery["used_content_fallback"]:
+        fallback_cap = max(max_pages, FALLBACK_RETRY_MIN_PAGES)
+        fallback_urls = [u for u in discovery["all_pages"] if u not in urls][:fallback_cap]
+        if fallback_urls:
+            print(f"[generic] the {len(urls)} hint-matched page(s) yielded no real products — "
+                  f"retrying across {len(fallback_urls)} other sitemap page(s) by content "
+                  f"instead of trusting the hint match (slower).")
+            rows, fb_attempted, pushback = _extract_from_pages(fallback_urls)
+            print(f"[generic] extracted {len(rows)} products from {fb_attempted} pages (fallback pass)")
+            attempted += fb_attempted
+
+    return rows, attempted, pushback
 
 
 def main():

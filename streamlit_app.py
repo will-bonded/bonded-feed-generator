@@ -129,7 +129,23 @@ def run_pipeline(url: str) -> tuple[dict, bytes, str]:
 
 
 def show_summary(summary: dict, log_text: str) -> None:
-    if summary["total"] == 0:
+    if summary.get("bot_pushback_detected"):
+        # A more specific, more actionable diagnosis than the generic
+        # messages below, whenever it applies -- the site actively refused
+        # requests partway through, a different situation from robots.txt
+        # disallowing a path or the page just lacking product markup.
+        if summary["total"] > 0:
+            st.warning(
+                f"This site appears to push back against automated access at volume — "
+                f"stopped early and delivering a **partial** feed with the "
+                f"**{summary['total']}** product(s) found before that happened."
+            )
+        else:
+            st.warning(
+                "This site appears to push back against automated access at volume — "
+                "no products were captured before that happened."
+            )
+    elif summary["total"] == 0:
         if summary.get("robots_blocked_count"):
             st.warning(
                 "No products were extracted — this site's robots.txt explicitly disallows the "
@@ -141,7 +157,8 @@ def show_summary(summary: dict, log_text: str) -> None:
                 "No products were extracted. The site may block scraping, require "
                 "JS rendering, or use a URL structure this tool doesn't recognize yet."
             )
-    else:
+
+    if summary["total"] > 0:
         st.markdown(
             f"Built **{summary['total']}** rows — "
             f"<span class=\"status-badge status-success\">{summary['clean']} clean</span> "
@@ -205,6 +222,13 @@ def handle_daily_registration(url: str) -> None:
         summary, csv_bytes, log_text = run_pipeline(url)
 
     show_summary(summary, log_text)
+    if summary.get("bot_pushback_detected"):
+        st.info(
+            "Since this is a daily-refresh feed, tomorrow's automatic nightly refresh will "
+            "attempt this store again. If the same limit gets hit again, it may take several "
+            "attempts (or may not fully resolve on its own) before the feed is complete — "
+            "this isn't a guarantee, just another chance."
+        )
     if summary["total"] == 0:
         return
 
