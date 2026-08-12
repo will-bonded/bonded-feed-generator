@@ -9,7 +9,13 @@ from .security import validate_public_url, SecurityError
 from . import robots
 
 USER_AGENT = "BondedFeedBot/1.0 (+catalog feed generation for client store; contact: agency)"
-TIMEOUT = 10
+# 10s was too tight: a real site hit during testing serves a (dynamically
+# generated, not cached) sitemap endpoint that consistently takes ~11.5s to
+# respond — a hard 10s timeout failed on it every single time, not just
+# occasionally, silently losing real product data with no error surfaced
+# beyond "unreachable". 20s gives real slow-but-legitimate endpoints enough
+# room without waiting excessively long on something that's truly dead.
+TIMEOUT = 20
 MAX_REDIRECTS = 5
 DEFAULT_REQUEST_DELAY = 0.3  # baseline politeness delay when a site's robots.txt asks for nothing more
 

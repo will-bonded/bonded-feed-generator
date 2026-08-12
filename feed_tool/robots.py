@@ -82,6 +82,18 @@ def is_allowed(url: str, user_agent: str) -> bool:
     return allowed
 
 
+def declared_sitemaps(url: str) -> list[str]:
+    """Sitemap URLs a site's robots.txt declares via `Sitemap:` directives —
+    the standard way a site points crawlers at a sitemap that isn't at the
+    conventional /sitemap.xml path (a very common real-world case: many
+    sites only have e.g. /sitemap_index.xml, or several locale-specific
+    sitemaps, with no generic /sitemap.xml at all)."""
+    try:
+        return list(_get_parser(url).sitemaps)
+    except Exception:
+        return []
+
+
 def crawl_delay(url: str, user_agent: str) -> float:
     try:
         rp = _get_parser(url)

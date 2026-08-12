@@ -25,6 +25,10 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
     print(f"[detect] platform={platform} — {detection['notes']}")
 
     rows: list[dict] = []
+    # Only meaningfully known for the generic HTML-scraping path (one HTTP
+    # request per candidate page) -- shopify pulls everything from one paged
+    # JSON API, so "pages attempted" isn't a comparable count there.
+    pages_attempted = None
 
     if platform == "shopify":
         count = 0
@@ -36,17 +40,31 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
     elif platform == "woocommerce":
         print("[woocommerce] Store API extraction not yet wired up in this build — "
               "falling back to generic JSON-LD scraping.")
-        rows = _run_generic(base_url, max_pages, url_contains)
+        rows, pages_attempted = _run_generic(base_url, max_pages, url_contains)
 
     else:
-        rows = _run_generic(base_url, max_pages, url_contains)
+        rows, pages_attempted = _run_generic(base_url, max_pages, url_contains)
 
     blocked_count = robots.get_block_count()
     if blocked_count:
         print(f"[robots] skipped {blocked_count} request(s) this site's robots.txt disallows for us")
 
     if not rows:
-        if blocked_count:
+        # robots.txt is only the FULL explanation when it accounts for every
+        # attempted page -- a small blocked_count next to a much larger
+        # pages_attempted (e.g. 2 of 250) means most pages were fetched fine
+        # and failed extraction for an unrelated reason, so blaming robots.txt
+        # alone would be actively misleading about where to look next.
+        if blocked_count and pages_attempted and blocked_count >= pages_attempted:
+            print("[warn] No products extracted — this site's robots.txt explicitly disallows the "
+                  "page(s) this tool needed to fetch. That's not a bug; the site has asked crawlers "
+                  "not to access them, so there's nothing further this tool can do here.")
+        elif blocked_count and pages_attempted:
+            print(f"[warn] No products extracted — {blocked_count} of {pages_attempted} candidate page(s) "
+                  f"were blocked by robots.txt, but the rest ({pages_attempted - blocked_count}) were "
+                  f"fetched fine and still failed extraction. Site may block scraping in other ways, "
+                  f"require JS rendering, or use a page structure this tool's extractor doesn't recognize.")
+        elif blocked_count:
             print("[warn] No products extracted — this site's robots.txt explicitly disallows the "
                   "page(s) this tool needed to fetch. That's not a bug; the site has asked crawlers "
                   "not to access them, so there's nothing further this tool can do here.")
@@ -56,10 +74,11 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
 
     summary = write_feed(rows, output_path, default_currency=currency)
     summary["robots_blocked_count"] = blocked_count
+    summary["pages_attempted"] = pages_attempted
     return summary
 
 
-def _run_generic(base_url: str, max_pages: int, url_contains) -> list[dict]:
+def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict], int]:
     print("[generic] discovering product URLs via sitemap.xml ...")
     discovery = crawl.discover_product_urls(base_url, url_contains=url_contains, max_pages=max_pages)
     urls = discovery["urls"]
@@ -76,6 +95,12 @@ def _run_generic(base_url: str, max_pages: int, url_contains) -> list[dict]:
         print(f"[warn] sitemap has MORE matching product URLs than --max-pages ({max_pages}) — "
               f"this feed is INCOMPLETE. Re-run with a higher --max-pages to capture the rest.")
 
+    if discovery["discovery_time_capped"]:
+        print(f"[warn] this site's sitemap structure was too large/slow to fully explore within the "
+              f"discovery time budget — some sub-sitemaps were never checked, so this feed may be "
+              f"INCOMPLETE regardless of --max-pages. Found {len(urls)} candidate(s) from what was "
+              f"checked before stopping.")
+
     rows = []
     for i, url in enumerate(urls, 1):
         html = get_text(url)
@@ -88,7 +113,7 @@ def _run_generic(base_url: str, max_pages: int, url_contains) -> list[dict]:
             print(f"[generic] processed {i}/{len(urls)}")
 
     print(f"[generic] extracted {len(rows)} products from {len(urls)} pages")
-    return rows
+    return rows, len(urls)
 
 
 def main():
