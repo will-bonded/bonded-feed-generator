@@ -36,6 +36,7 @@ import streamlit as st
 from feed_tool.cli import build_feed
 from feed_tool.security import validate_public_url, SecurityError
 from feed_tool.turnstile import verify_turnstile
+from feed_tool._http import USER_AGENT
 from feed_tool import registry
 
 APP_TITLE = "Bonded Feed Generator"
@@ -145,6 +146,13 @@ def show_summary(summary: dict, log_text: str) -> None:
                 "This site appears to push back against automated access at volume — "
                 "no products were captured before that happened."
             )
+        st.markdown(
+            "**Want a complete feed?** Ask the store's development or hosting team to "
+            "allowlist this tool's User-Agent string in their firewall/bot-protection "
+            "settings — once allowlisted, a re-run should get the full catalog instead "
+            "of a partial one."
+        )
+        st.code(USER_AGENT)
     elif summary["total"] == 0:
         if summary.get("robots_blocked_count"):
             st.warning(

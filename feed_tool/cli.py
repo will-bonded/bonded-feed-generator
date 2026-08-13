@@ -11,7 +11,7 @@ import sys
 
 from .detect import detect_platform
 from .sources import shopify, crawl, generic
-from ._http import get_text_with_status
+from ._http import get_text_with_status, USER_AGENT
 from .feed import write_feed
 from . import robots
 
@@ -97,6 +97,9 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
         else:
             print("[warn] this site appears to push back against automated access at volume — "
                   "no products were captured before that happened.")
+        print(f"[info] For a complete feed, ask the site's dev/hosting team to allowlist this "
+              f"tool's User-Agent in their firewall/bot-protection settings:\n"
+              f"       {USER_AGENT}")
     elif not rows:
         # robots.txt is only the FULL explanation when it accounts for every
         # attempted page -- a small blocked_count next to a much larger

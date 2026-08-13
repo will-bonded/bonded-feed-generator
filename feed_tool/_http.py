@@ -8,7 +8,7 @@ import requests
 from .security import validate_public_url, SecurityError
 from . import robots
 
-USER_AGENT = "BondedFeedBot/1.0 (+catalog feed generation for client store; contact: agency)"
+USER_AGENT = "BondedFeedBot/1.0 (+catalog feed generation for client store; contact: connect@bondedagency.com)"
 # 10s was too tight: a real site hit during testing serves a (dynamically
 # generated, not cached) sitemap endpoint that consistently takes ~11.5s to
 # respond — a hard 10s timeout failed on it every single time, not just
