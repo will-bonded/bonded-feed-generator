@@ -250,6 +250,10 @@ def discover_product_urls(
 
     return {
         "urls": candidates[:max_pages],
+        # How many candidates existed before max_pages cut the list — lets the
+        # caller tell "this run covered everything" from "this run covered N of
+        # roughly M" (used for the quick-vs-full build handoff and its ETA).
+        "candidates_total": len(candidates),
         # Deliberately NOT capped to max_pages like `urls` is: its purpose is
         # to give the caller something BROADER to retry against when the
         # hint-matched `urls` turn out to be wrong (see the docstring above)

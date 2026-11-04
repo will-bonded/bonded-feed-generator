@@ -227,3 +227,122 @@ launcher used during this build, silently falling back to the emoji
 favicon and no logo with no error at all). Anchoring to `__file__` is
 correct regardless of launch method — including Streamlit Community
 Cloud's own — so this isn't a workaround for one specific environment.
+
+## Quick in-app builds, plus full builds in the background
+
+Streamlit Community Cloud drops long-running browser sessions (no documented
+limit; forum reports range from ~5 to 30 minutes), and when the connection
+drops the browser can't reattach — the finished result is simply lost. A big
+catalogue crawls at roughly 0.6s/page (one large real run, 2000 pages ≈ 20
+minutes), so the old "build everything synchronously" design could never
+reliably finish for large stores.
+
+So the in-app build is capped (`IN_APP_MAX_PAGES = 400`, ~4 minutes at that
+rate) and, when a store has more or pushes back, the result offers a **full
+build in the background** (`.github/workflows/build-feed.yml`, started via
+`workflow_dispatch`, polled by `feed_tool/jobs.py`). Choices worth keeping:
+
+- **The job id lives in the page URL** (`?job=<uuid4 hex>`), so a refresh or
+  dropped connection resumes instead of losing the build. It's also what makes
+  the result link unguessable — there's no listing of anyone's builds.
+- **Hybrid, not everything-through-the-job.** A background build adds a
+  queue + install wait (~1–2 min, estimated) to every run; routing small
+  stores through it would make the common case slower. Only builds that were
+  capped or cut off are offered the upgrade.
+- **No fake progress bar.** GitHub reports queued / running / done, not "250 of
+  400 pages". The page shows elapsed time and a rough range instead.
+- **Caps come from GitHub's own run list** (builds per hour, builds running at
+  once), the same "derive it from existing state, store nothing about users"
+  principle as the registration caps in `registry.py`.
+- **The dispatch API doesn't return a run id** (as understood — worth
+  re-checking), so the workflow's `run-name` embeds the job id and the app
+  finds its run by that title.
+- **One-off results are artifacts, not commits**, retained one day. Cost:
+  they sit in a public repo for that day (likely downloadable by any signed-in
+  GitHub user who finds the run) and store URLs show in run inputs/logs. The
+  data is public product data, but the result page says so rather than keeping
+  the old "saved nowhere" claim on this path. A private repo would avoid it
+  but splits setup and burns the free Actions minutes quota; not done.
+- **Kill switch:** `background_builds_enabled` (secret) gates the whole thing,
+  so the code can ship ahead of the token permission it needs.
+- Actions runners use datacenter IPs that some sites treat differently from
+  Streamlit's — the User-Agent allowlist request remains the only ask we can
+  make of a blocking site.
+- **Daily registration stays app-side** for background builds, with the feed id
+  derived from the job id (`job_id[:10]`) so reopening or re-sharing a build
+  link can't register it twice. Trade-off: the user has to come back to the
+  link to finish registering. Having the workflow register itself is a
+  possible later step (it would need to share a concurrency group with the
+  nightly job, which also commits).
+
+## Which field is the feed `id` — chosen after seeing the options
+
+A Meta pixel's `content_ids` must match the catalogue item `id`, and which field
+a store's pixel sends varies (variant ID, SKU, a parent product ID). Static
+detection of the pixel was investigated and **dropped**: on every store
+checked, the pixel code wasn't in the raw page HTML (it's loaded through Tag
+Manager or Shopify's sandboxed web-pixel runtime, whose script bundle the
+store's own robots.txt disallows us to fetch), and capturing it live needs a
+real browser that would also fire real events into the client's pixel.
+
+What shipped instead:
+
+- The per-platform defaults are unchanged — they're what actually matched on a
+  real high-volume Shopify account (99%+ pixel-to-catalogue match, using the
+  raw variant ID as `id` and the product ID as `item_group_id`).
+- After a build the user sees every candidate ID side by side (to compare with
+  Meta Pixel Helper) and picks the source. Because each row carries all its
+  candidate IDs (`_ids`, never written to the CSV), switching is a local
+  re-key — no re-crawl, and it works the same for background builds.
+- Shopify offers Default and SKU only. "Product ID" would give a product's
+  variants one shared id, which Meta treats as duplicates; the product ID is
+  already in the feed as `item_group_id`.
+- Rows missing the chosen field are **flagged, not filled** from another
+  source: a feed mixing ID sources can't match a pixel sending only one of
+  them, so a visible hole beats a plausible wrong id.
+- Generic stores with no SKU / `productID` fall back to the page URL as id,
+  which can never match a pixel — that's counted and warned about.
+- A daily feed saves the choice (`id_field`) on its registry entry, and the
+  nightly job applies it. Changing it later re-keys the catalogue, so it goes
+  through the contact flow rather than self-service.
+
+## A bad night must not replace a good live feed
+
+Meta treats the latest file as the source of truth, and `write_feed` always
+overwrites — so a night where the site was down, blocked us mid-run, or came
+back thin used to replace a complete feed (an empty run replaced it with a
+header-only CSV). The nightly job now builds into a temp file and only
+replaces the live feed when the result is trustworthy
+(`decide_replacement` in `scripts/regenerate_feeds.py`):
+
+- 0 products: keep the previous feed; counts toward auto-pruning as before.
+- The site pushed back mid-run: keep the previous feed, but do **not** count
+  it toward pruning — pruning deletes the feed outright, and a stale feed is
+  better for the client than a missing one while a site is only temporarily
+  refusing us.
+- Under 70% of the live feed's size: keep it, but accept the smaller feed
+  after 3 such nights running (a real clearance or range cut is possible).
+- A feed's first run is accepted whatever it contains (nothing to protect).
+
+Registering an incomplete feed as a daily feed also needs an explicit
+confirmation in the app.
+
+## Tests live in the repo now
+
+The earlier regression scripts were throwaway files in a temp folder and got
+wiped. `tests/` (standard-library `unittest`, no network, no secrets) now
+covers discovery, the CLI behaviours (robots messaging, hint fallback, caps,
+bot pushback), ID sources, the nightly guard, the job plumbing, and drives the
+real `streamlit_app.py` headlessly with Streamlit's `AppTest` — from a clean
+temp copy, so a local `.streamlit/secrets.toml` can't leak in. Run:
+`python -m unittest discover -s tests -t .`
+
+Two things the app tests caught that are worth remembering:
+
+- `st.table` / `st.dataframe` need `pyarrow`, which a Streamlit install can
+  lack. The sample-ID table is plain markdown (values in code spans, since
+  they're scraped text) so nothing in the app depends on it.
+- Streamlit has marked `st.components.v1.html` (used by the Turnstile widget)
+  for removal. It still works today; replacing it with `st.iframe` needs a
+  real Cloudflare challenge to verify the token callback survives, so it's
+  left as is — a follow-up before a Streamlit upgrade removes it.

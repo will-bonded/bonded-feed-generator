@@ -124,6 +124,14 @@ def normalize(raw_product: dict, base_url: str) -> list[dict]:
             "image_link": image_link,
             "brand": brand or "",
             "sku": v.get("sku", ""),
+            # Every field that could plausibly be a store's pixel `content_ids`
+            # value, kept alongside the row (not written to the CSV) so the ID
+            # source can be switched after the build without a re-crawl.
+            "_ids": {
+                "variant_id": str(v.get("id")),
+                "sku": v.get("sku", "") or "",
+                "product_id": str(product_id),
+            },
         })
 
     return rows

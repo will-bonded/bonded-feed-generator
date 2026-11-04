@@ -163,6 +163,40 @@ blocked, whatever) doesn't stop the rest from refreshing. Nothing further
 to configure — it works off whatever's already in `registry.json` once
 people start using the daily-refresh flow.
 
+A night's result only replaces the live feed when it's trustworthy: an
+empty run, a run the site cut off partway through, or one that shrank to
+under 70% of the live feed keeps the previous file instead (a big shrink is
+accepted after 3 nights in a row, in case the catalogue really did get
+smaller). See `scripts/regenerate_feeds.py`.
+
+### 7. Optional: full builds in the background
+
+A quick in-app build is capped at 400 pages so it finishes well inside what a
+hosted Streamlit session survives (long-running sessions get dropped, losing
+the result). When a store has more than that — or pushes back mid-run — the
+result can offer a **full build in the background** instead:
+`.github/workflows/build-feed.yml` runs the crawl on GitHub Actions, and the
+app polls it. The build's id lives in the page URL, so a refresh or
+reconnect resumes it; the result is a one-day artifact (nothing is committed
+to the repo).
+
+To switch it on:
+
+1. Add **Actions: Read and write** to the token from step 4 (on top of
+   Contents), so the app can start builds and read their results.
+2. Add `background_builds_enabled = true` to the app's secrets (step 5).
+
+It stays off until step 2, and until then the app behaves as a
+quick-build-only app. Two things to know before enabling it:
+
+- Results are held as workflow artifacts in this **public** repo for about a
+  day. Product data is public anyway, but they're likely downloadable by any
+  signed-in GitHub user who finds the run, and store URLs appear in the run's
+  inputs and logs — so the one-off CSV isn't strictly "saved nowhere" on this
+  path (the app says so on the result page).
+- The crawl runs from GitHub's servers, whose IP ranges some sites treat
+  differently from Streamlit's. Re-test any site that gave trouble.
+
 ### Deferred, not built yet
 
 - **Custom domain** (e.g. a `bonded.co.uk` subdomain) — Streamlit's free
@@ -175,6 +209,12 @@ people start using the daily-refresh flow.
 ```bash
 pip install -r requirements.txt
 streamlit run streamlit_app.py
+```
+
+Run the tests (standard library only, fully offline — no network, no secrets):
+
+```bash
+python -m unittest discover -s tests -t .
 ```
 
 For local testing of the daily-refresh flow, create `.streamlit/secrets.toml`

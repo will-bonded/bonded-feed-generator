@@ -12,8 +12,8 @@ import sys
 from .detect import detect_platform
 from .sources import shopify, crawl, generic
 from ._http import get_text_with_status, USER_AGENT
-from .feed import write_feed
-from . import robots
+from .feed import build_summary, write_csv
+from . import idsource, robots
 
 # Floor for how many pages the content-based fallback retry (see
 # _run_generic below) will sample, independent of --max-pages. That
@@ -51,12 +51,25 @@ _BOT_STATUS_STREAK_THRESHOLD = 10
 
 
 def build_feed(base_url: str, output_path: str, currency: str = "GBP",
-                max_pages: int = 2000, url_contains=None) -> dict:
+                max_pages: int = 2000, url_contains=None,
+                id_field: str = "default", fallback_cap: int | None = None) -> dict:
+    """
+    `id_field` picks which product field becomes the feed `id` (see
+    idsource.py). `fallback_cap` bounds the content-based retry pass
+    separately from `max_pages` — left unset it floors at
+    FALLBACK_RETRY_MIN_PAGES, which suits an unattended run; the interactive
+    web app passes a smaller value so a quick build stays quick.
+    """
     robots.reset_block_count()  # isolate this run's count from any previous/concurrent one
 
     detection = detect_platform(base_url)
     platform = detection["platform"]
     print(f"[detect] platform={platform} — {detection['notes']}")
+
+    kind = idsource.platform_kind(platform)
+    field, id_warning = idsource.effective_id_field(id_field, kind)
+    if id_warning:
+        print(f"[warn] {id_warning}")
 
     rows: list[dict] = []
     # Only meaningfully known for the generic HTML-scraping path (one HTTP
@@ -64,6 +77,8 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
     # JSON API, so "pages attempted" isn't a comparable count there.
     pages_attempted = None
     pushback_detected = False
+    candidates_total = None
+    capped = False  # True when this run covered only part of what the site has
 
     if platform == "shopify":
         count = 0
@@ -75,10 +90,14 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
     elif platform == "woocommerce":
         print("[woocommerce] Store API extraction not yet wired up in this build — "
               "falling back to generic JSON-LD scraping.")
-        rows, pages_attempted, pushback_detected = _run_generic(base_url, max_pages, url_contains)
+        rows, info = _run_generic(base_url, max_pages, url_contains, fallback_cap)
+        pages_attempted, pushback_detected = info["pages_attempted"], info["pushback"]
+        candidates_total, capped = info["candidates_total"], info["capped"]
 
     else:
-        rows, pages_attempted, pushback_detected = _run_generic(base_url, max_pages, url_contains)
+        rows, info = _run_generic(base_url, max_pages, url_contains, fallback_cap)
+        pages_attempted, pushback_detected = info["pages_attempted"], info["pushback"]
+        candidates_total, capped = info["candidates_total"], info["capped"]
 
     blocked_count = robots.get_block_count()
     if blocked_count:
@@ -123,10 +142,28 @@ def build_feed(base_url: str, output_path: str, currency: str = "GBP",
             print("[warn] No products extracted. Site may block scraping, require JS "
                   "rendering, or use a URL structure not covered by the default hints.")
 
-    summary = write_feed(rows, output_path, default_currency=currency)
+    summary = build_summary(rows, default_currency=currency)
+    summary["platform"] = kind
+    summary = idsource.rekey(summary, field, kind)
+    write_csv(output_path, summary["rows"])
+
+    if summary["id_url_fallback_count"]:
+        print(f"[warn] {summary['id_url_fallback_count']} product(s) had no SKU or product ID on "
+              f"their page, so their feed id is the page URL — that can never match a pixel's "
+              f"content_ids.")
+    if summary["duplicate_ids"]:
+        print(f"[warn] {summary['duplicate_ids']} feed id(s) are used by more than one product — "
+              f"Meta treats those as duplicates.")
+    if field != idsource.DEFAULT and summary["missing_id_count"]:
+        print(f"[warn] {summary['missing_id_count']} product(s) have no "
+              f"{idsource.LABELS[field]} and are flagged (they would otherwise get a different "
+              f"ID source, which can't match a pixel sending only {idsource.LABELS[field]}).")
+
     summary["robots_blocked_count"] = blocked_count
     summary["pages_attempted"] = pages_attempted
     summary["bot_pushback_detected"] = pushback_detected
+    summary["candidates_total"] = candidates_total
+    summary["capped"] = capped
     return summary
 
 
@@ -159,7 +196,12 @@ def _extract_from_pages(urls: list[str]) -> tuple[list[dict], int, bool]:
     return rows, len(urls), False
 
 
-def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict], int, bool]:
+def _run_generic(base_url: str, max_pages: int, url_contains,
+                 fallback_cap: int | None = None) -> tuple[list[dict], dict]:
+    """Returns (rows, info) where info = {"pages_attempted", "pushback",
+    "candidates_total", "capped"}. `capped` means this run covered only part
+    of what the site has (a page cap or the discovery time budget cut it
+    short) — a different thing from `pushback`, where the site cut us off."""
     print("[generic] discovering product URLs via sitemap.xml ...")
     discovery = crawl.discover_product_urls(base_url, url_contains=url_contains, max_pages=max_pages)
     urls = discovery["urls"]
@@ -185,11 +227,15 @@ def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict
     rows, attempted, pushback = _extract_from_pages(urls)
     print(f"[generic] extracted {len(rows)} products from {attempted} pages")
 
+    candidates_total = discovery["candidates_total"]
+    capped = bool(discovery["truncated"] or discovery["discovery_time_capped"])
+
     if pushback:
         # Already cut off once on this same site in this same run -- a large
         # fallback retry right after would almost certainly just hit the same
         # wall again, wasting time rather than finding anything new.
-        return rows, attempted, True
+        return rows, {"pages_attempted": attempted, "pushback": True,
+                      "candidates_total": candidates_total, "capped": capped}
 
     # A non-empty hint match isn't proof the real catalog was found: a site's
     # actual catalog can use no hint keyword at all while one unrelated,
@@ -200,8 +246,9 @@ def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict
     # pages extracted nothing real, retry via content-based extraction
     # across every other page found before giving up.
     if not rows and not discovery["used_content_fallback"]:
-        fallback_cap = max(max_pages, FALLBACK_RETRY_MIN_PAGES)
-        fallback_urls = [u for u in discovery["all_pages"] if u not in urls][:fallback_cap]
+        cap = fallback_cap if fallback_cap is not None else max(max_pages, FALLBACK_RETRY_MIN_PAGES)
+        remaining = [u for u in discovery["all_pages"] if u not in urls]
+        fallback_urls = remaining[:cap]
         if fallback_urls:
             print(f"[generic] the {len(urls)} hint-matched page(s) yielded no real products — "
                   f"retrying across {len(fallback_urls)} other sitemap page(s) by content "
@@ -209,8 +256,13 @@ def _run_generic(base_url: str, max_pages: int, url_contains) -> tuple[list[dict
             rows, fb_attempted, pushback = _extract_from_pages(fallback_urls)
             print(f"[generic] extracted {len(rows)} products from {fb_attempted} pages (fallback pass)")
             attempted += fb_attempted
+            # The hint-matched count above described the wrong set of pages;
+            # what this run actually sampled from is every page the sitemap had.
+            candidates_total = len(discovery["all_pages"])
+            capped = bool(len(remaining) > cap or discovery["discovery_time_capped"])
 
-    return rows, attempted, pushback
+    return rows, {"pages_attempted": attempted, "pushback": pushback,
+                  "candidates_total": candidates_total, "capped": capped}
 
 
 def main():
@@ -223,6 +275,10 @@ def main():
                               "the tool warns if the site has more than this)")
     parser.add_argument("--url-contains", nargs="*", default=None,
                          help="Path fragments that mark a product URL, e.g. /product/ /shop/")
+    parser.add_argument("--id-field", choices=sorted(idsource.LABELS), default=idsource.DEFAULT,
+                         help="Which product field becomes the feed id, to match the store's "
+                              "pixel content_ids. 'default' is the variant ID on Shopify and "
+                              "SKU > productID > page URL elsewhere.")
     parser.add_argument("--google-sheet-id", default=None,
                          help="If set (with --google-credentials), also push the feed to this "
                               "Google Sheet (the sheet ID from its URL), in addition to the CSV.")
@@ -236,6 +292,7 @@ def main():
         currency=args.currency,
         max_pages=args.max_pages,
         url_contains=args.url_contains,
+        id_field=args.id_field,
     )
 
     print(f"\n[done] wrote {summary['total']} rows to {args.output}")

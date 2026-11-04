@@ -75,8 +75,11 @@ def normalize_jsonld(product: dict, page_url: str) -> dict:
     if isinstance(brand, dict):
         brand = brand.get("name", "")
 
+    sku = str(product.get("sku") or "")
+    product_id = str(product.get("productID") or "")
+
     return {
-        "id": str(product.get("sku") or product.get("productID") or page_url),
+        "id": sku or product_id or page_url,
         "item_group_id": "",
         "title": product.get("name", ""),
         "description": product.get("description", ""),
@@ -89,6 +92,7 @@ def normalize_jsonld(product: dict, page_url: str) -> dict:
         "brand": brand,
         "sku": product.get("sku", ""),
         "_source": "jsonld",
+        "_ids": {"sku": sku, "product_id": product_id, "url": page_url},
     }
 
 
@@ -135,6 +139,7 @@ def extract_opengraph_product(html: str, page_url: str) -> dict | None:
         "brand": brand,
         "sku": sku,
         "_source": "opengraph",
+        "_ids": {"sku": sku, "product_id": "", "url": page_url},
     }
 
 
