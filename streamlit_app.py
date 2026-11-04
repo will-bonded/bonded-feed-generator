@@ -210,11 +210,21 @@ def show_warnings(summary: dict) -> None:
         )
         st.code(USER_AGENT)
     elif summary["total"] == 0:
-        if summary.get("robots_blocked_count"):
+        # robots.txt is only the whole explanation when it accounts for every
+        # page attempted; a few blocked requests among many fetched-fine pages
+        # (same rule the CLI log applies) is a different, unrelated failure.
+        blocked, attempted = summary.get("robots_blocked_count"), summary.get("pages_attempted")
+        fully_blocked = bool(blocked) and (attempted is None or blocked >= attempted)
+        if fully_blocked:
             st.warning(
                 "No products were extracted — this site's robots.txt explicitly disallows the "
                 "page(s) this tool needed to fetch. That's not a bug; the site has asked crawlers "
                 "not to access them, so there's nothing further this tool can do here."
+            )
+        elif summary.get("capped"):
+            st.warning(
+                "No products turned up in the pages this quick build checked — but it only "
+                "covered part of the site, so products may be further in."
             )
         else:
             st.warning(
@@ -292,6 +302,11 @@ def render_result(result: dict) -> None:
 
     if summary["total"] == 0:
         show_log(result["log"])
+        # A quick build that found nothing can still be a build that only
+        # looked at part of the site (or got cut off) — the full build is
+        # exactly the way forward there, so it's offered here too.
+        render_background_offer(result, summary)
+        render_pending_verification()
         render_start_over()
         return
 
@@ -396,10 +411,12 @@ def render_background_offer(result: dict, summary: dict) -> None:
         )
     elif total and total > summary["total"]:
         low, high = jobs.estimate_range_minutes(total)
+        found = (f"covered {summary['total']} of roughly {total} products" if summary["total"]
+                 else f"found no products in the part of the site it checked (roughly {total} pages in all)")
         st.write(
-            f"This quick build covered {summary['total']} of roughly {total} products. A full "
-            f"build takes about {low}–{high} minutes (a rough range — it varies a lot by site) "
-            f"and runs in the background: you can close this tab and come back to the link."
+            f"This quick build {found}. A full build takes about {low}–{high} minutes "
+            f"(a rough range — it varies a lot by site) and runs in the background: you can "
+            f"close this tab and come back to the link."
         )
     else:
         st.write("A full build runs in the background, so you can close this tab and come back to the link.")

@@ -25,8 +25,10 @@ STORE = "https://shop.invalid"
 
 def fake_build_feed(**flags):
     """A stand-in for cli.build_feed returning a real, fully-shaped summary."""
+    empty = flags.pop("empty", False)
+
     def _build(url, out_path, **kwargs):
-        rows = shopify.normalize(shopify_product(), url)
+        rows = [] if empty else shopify.normalize(shopify_product(), url)
         summary = build_summary(rows)
         summary["platform"] = "shopify"
         summary = idsource.rekey(summary, "default", "shopify")
@@ -188,6 +190,46 @@ class PartialAndBackground(unittest.TestCase):
             buttons(at)["Run the full build in the background"].click().run()
         self.assertIn("Try again soon.", texts(at.error))
         self.assertFalse(dispatch.called)
+
+
+class NothingFoundInAQuickBuild(unittest.TestCase):
+    """A quick build can find nothing yet still have only looked at part of the
+    site (products buried deep in the sitemap) — that must not be a dead end."""
+
+    def run_empty(self, background=True, **flags):
+        return app(turnstile=True, github=True, background=background,
+                   build=fake_build_feed(empty=True, **flags), query=verified_return())
+
+    def test_capped_with_no_products_says_so_and_offers_the_full_build(self):
+        with self.run_empty(capped=True, candidates_total=3000, pages_attempted=400) as (at, _):
+            at.run()
+        self.assertFalse(at.exception, at.exception)
+        self.assertTrue(any("only covered part of the site" in t for t in texts(at.warning)))
+        self.assertIn("Run the full build in the background", buttons(at))
+        self.assertTrue(any("found no products in the part of the site it checked" in t
+                            for t in texts(at.markdown)))
+
+    def test_pushback_with_no_products_also_offers_it(self):
+        with self.run_empty(bot_pushback_detected=True) as (at, _):
+            at.run()
+        self.assertIn("Run the full build in the background", buttons(at))
+
+    def test_no_offer_when_the_feature_is_off_or_nothing_was_cut_short(self):
+        with self.run_empty(background=False, capped=True, candidates_total=3000) as (at, _):
+            at.run()
+        self.assertNotIn("Run the full build in the background", buttons(at))
+        with self.run_empty() as (at, _):                 # complete run, genuinely nothing there
+            at.run()
+        self.assertNotIn("Run the full build in the background", buttons(at))
+        self.assertTrue(any("No products were extracted. The site may block" in t for t in texts(at.warning)))
+
+    def test_robots_is_only_blamed_when_it_accounts_for_every_page(self):
+        with self.run_empty(robots_blocked_count=2, pages_attempted=400) as (at, _):
+            at.run()
+        self.assertFalse(any("robots.txt" in t for t in texts(at.warning)))
+        with self.run_empty(robots_blocked_count=5, pages_attempted=5) as (at, _):
+            at.run()
+        self.assertTrue(any("robots.txt explicitly disallows" in t for t in texts(at.warning)))
 
 
 class DailyRegistration(unittest.TestCase):
